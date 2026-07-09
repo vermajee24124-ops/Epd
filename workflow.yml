@@ -1,82 +1,44 @@
-name: Transcribe Episodes
+name: PocketFM Qwen Transcript 1-200
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - "main.py"
-      - ".github/workflows/transcribe.yml"
-      - "requirements.txt"
 
 permissions:
   contents: write
 
 concurrency:
-  group: transcribe-episodes
+  group: pocketfm-qwen-transcript-1-200
   cancel-in-progress: false
 
 jobs:
   transcribe:
+    name: Transcribe Episode 1-200
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run transcription pipeline
+      - name: Transcribe and save episodes
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_SOURCE_REPO_ID: ${{ secrets.HF_SOURCE_REPO_ID }}
-          HF_SOURCE_REPO_TYPE: ${{ secrets.HF_SOURCE_REPO_TYPE }}
-          HF_SOURCE_FOLDER: ${{ secrets.HF_SOURCE_FOLDER }}
-          HF_OUTPUT_REPO_ID: ${{ secrets.HF_OUTPUT_REPO_ID }}
-          HF_OUTPUT_REPO_TYPE: ${{ secrets.HF_OUTPUT_REPO_TYPE }}
-          HF_OUTPUT_FOLDER: ${{ secrets.HF_OUTPUT_FOLDER }}
-          QWEN_API_URL: ${{ secrets.QWEN_API_URL }}
           QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-          QWEN_MODEL: ${{ secrets.QWEN_MODEL }}
-          REQUEST_DELAY_SECONDS: ${{ secrets.REQUEST_DELAY_SECONDS }}
-          RETRY_BASE_SECONDS: ${{ secrets.RETRY_BASE_SECONDS }}
-          MAX_RETRIES: ${{ secrets.MAX_RETRIES }}
-          TRANSCRIBE_PROMPT: ${{ secrets.TRANSCRIBE_PROMPT }}
-          LOCAL_EPISODE_FOLDER: episodes
-        run: |
-          python main.py
-
-      - name: Commit generated GitHub folder
-        run: |
-          if [ -d episodes ] && [ "$(ls -A episodes)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add episodes/
-            if ! git diff --cached --quiet; then
-              git commit -m "Add generated episode transcripts"
-              git push
-            else
-              echo "No changes to commit."
-            fi
-          else
-            echo "No episodes folder generated."
-          fi
-
-      - name: Upload manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: transcribe-manifest
-          path: |
-            /tmp/pocketfm_qwen_work/state/manifest.json
-            /tmp/pocketfm_qwen_work/state/done.json
+        run: python main.py
