@@ -1,2 +1,2 @@
-huggingface_hub>=1.2.0,<2
+huggingface_hub>=0.33,<1
 openai>=1.52.0,<3
