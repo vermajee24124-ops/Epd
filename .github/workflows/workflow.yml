@@ -1,13 +1,13 @@
-name: PocketFM Qwen Transcript 1-200
+name: PocketFM Qwen Transcript Batch 20
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: pocketfm-qwen-transcript-1-200
+  group: pocketfm-qwen-transcript-batch20
   cancel-in-progress: false
 
 jobs:
@@ -17,27 +17,25 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
+      - name: Checkout public runner repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Transcribe and save episodes
+      - name: Transcribe Episode 1-200 in private HF batches
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
