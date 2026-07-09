@@ -1,17 +1,26 @@
-# PocketFM batch TXT transcription
+# Veda Continuity Builder v2
 
-Secrets:
+Public GitHub repo workflow that:
+- cleans raw transcript files with Gemma 4 31B
+- repairs merged-file boundary mistakes using adjacent episode context
+- analyzes continuity with Gemini 3.1 Flash-Lite
+- writes cleaned TXT and analysis JSON locally
+- batch uploads to Hugging Face
+
+Required secrets:
 - HF_TOKEN
-- QWEN_API_KEY
+- GEMINI_API_KEY
 
-Repo variables:
-- QWEN_BASE_URL
-- HF_REPO_ID
+Recommended repo variables:
+- HF_SOURCE_REPO_ID
+- HF_SOURCE_REPO_TYPE
 - HF_SOURCE_FOLDER
+- HF_OUTPUT_REPO_ID
+- HF_OUTPUT_REPO_TYPE
 - HF_OUTPUT_FOLDER
 - BATCH_SIZE
 - REQUEST_DELAY_SECONDS
 - RETRY_BASE_SECONDS
 - MAX_RETRIES
-- ENABLE_THINKING
-- QWEN_MODELS
+- CLEAN_MODEL
+- ANALYSIS_MODEL
