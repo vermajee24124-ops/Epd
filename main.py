@@ -54,7 +54,7 @@ PB = "Analyze this transcript and return JSON.\n\nTRANSCRIPT:\n{t}\n\nMEMORY:\n{
 # ===== CORE =====
 def clean_a(txt, ep, prev="", nxt=""):
     up = PA.format(prev=prev[-400:] or "(none)", curr=txt[:15000], next=nxt[:400] or "(none)") if (prev or nxt) else f"CLEAN THIS:\n\n{txt[:15000]}"
-    for fn,md in [(lambda s,u: gemini("gemini-2.5-flash-lite",s,u),"gemini"),(lambda s,u: gemini("gemma-4-31b-it",s,u),"gemma"),(lambda s,u: groq(s,u),"groq")]:
+    for fn,md in [(lambda s,u: gemini("gemini-3.1-flash-lite",s,u),"gemini"),(lambda s,u: gemini("gemma-4-31b-it",s,u),"gemma"),(lambda s,u: groq(s,u),"groq")]:
         ok,txt2,m=fn(SA,up)
         if ok: return re.sub(r'(?i)^(analysis|summary|note|commentary|here is|cleaned transcript|output)[:\s].*','',txt2).replace('```','').strip(),md
     return py_clean(txt),"python"
