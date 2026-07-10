@@ -1,404 +1,187 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
-import base64
-import json
-import logging
 import os
+import json
 import time
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import glob
+import re
+from huggingface_hub import HfApi
+import google.generativeai as genai
+from groq import Groq
+from openai import OpenAI
 
-import requests
-from huggingface_hub import HfApi, hf_hub_download
+# ================= Configuration =================
+HF_TOKEN = os.getenv("HF_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-LOG = logging.getLogger("pocketfm")
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+REPO_ID = "Kumarverma11/PocketFM_Audio"
+INPUT_FOLDER = "Transcripts_Episode_0001_to_0200"
+OUTPUT_BASE = "Veda_Training_Ready_FINAL_0001_to_0200"
+
+TRACK_A_DIR = os.path.join(OUTPUT_BASE, "TRACK_A_CLEAN_EPISODES")
+TRACK_B_DIR = os.path.join(OUTPUT_BASE, "TRACK_B_STORY_INTELLIGENCE")
+TRAINING_DIR = os.path.join(OUTPUT_BASE, "TRAINING_DATASETS")
+STATE_DIR = os.path.join(OUTPUT_BASE, "STATE")
+
+# Create directories
+for d in [TRACK_A_DIR, TRACK_B_DIR, TRAINING_DIR, STATE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# API Clients Initialization
+genai.configure(api_key=GEMINI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
+nvidia_client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY
 )
+hf_api = HfApi(token=HF_TOKEN)
 
-AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus", ".wma"}
-OUTPUT_TEXT_EXT = ".json"
-MANIFEST_NAME = "manifest.json"
+# ================= Functions =================
 
+def python_fallback_cleanup(text):
+    """Fallback: Basic Python string operations for grammar/spelling"""
+    text = re.sub(r'\s+', ' ', text) # Remove extra spaces
+    text = text.replace(" ,", ",").replace(" .", ".") # Fix basic punctuation
+    # Yahan aap custom dictionary replacements add kar sakte hain
+    return text.strip()
 
-def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    value = os.environ.get(name, default)
-    if required and not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value or ""
-
-
-def parse_range(filename: str) -> Optional[Tuple[int, int]]:
-    import re
-    s = Path(filename).stem.lower()
-
-    m = re.search(r"episode[_\s-]*(\d+)[_\s-]*(?:to|-)[_\s-]*(\d+)", s)
-    if not m:
-        m = re.search(r"episode[_\s-]*(\d+)[_\s-]+(\d+)", s)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-
-    m = re.search(r"episode[_\s-]*(\d+)", s)
-    if m:
-        n = int(m.group(1))
-        return n, n
-
-    return None
-
-
-def list_remote_audio_paths(api: HfApi, repo_id: str, repo_type: str, prefix: str) -> List[str]:
-    items = api.list_repo_tree(
-        repo_id=repo_id,
-        repo_type=repo_type,
-        recursive=True,
-        expand=False,
-    )
-
-    paths: List[str] = []
-    prefix = prefix.strip("/")
-
-    for item in items:
-        path = getattr(item, "path", "")
-        if Path(path).suffix.lower() not in AUDIO_EXTS:
-            continue
-        if prefix and not path.startswith(prefix + "/"):
-            continue
-        paths.append(path)
-
-    return sorted(paths)
-
-
-def remote_file_exists(api: HfApi, repo_id: str, repo_type: str, path_in_repo: str) -> bool:
+def run_track_a_cleanup(text, context_snippet=""):
+    """Track A: Clean Transcript (No analysis). Tries Gemini -> Groq -> Python"""
+    system_prompt = "You are a transcript cleaner. Output ONLY the corrected transcript. Fix grammar, spelling, and punctuation. Do NOT add any analysis, markdown, or conversational text."
+    prompt = f"Context (Do not alter this, use for reference only): {context_snippet}\n\nTranscript to clean:\n{text}"
+    
+    # Attempt 1: Gemini (Flash)
     try:
-        tree = api.list_repo_tree(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            recursive=True,
-            expand=False,
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(system_prompt + "\n\n" + prompt)
+        if response.text:
+            return response.text.strip()
+    except Exception as e:
+        print(f"Gemini API failed: {e}. Trying Groq...")
+
+    # Attempt 2: Groq
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama3-8b-8192", # Aap apne hisaab se model change kar sakte hain
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=4000
         )
-        target = path_in_repo.replace("\\", "/")
-        return any(getattr(item, "path", "").replace("\\", "/") == target for item in tree)
-    except Exception:
-        return False
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Groq API failed: {e}. Using Python Fallback...")
+    
+    # Attempt 3: Python Fallback
+    return python_fallback_cleanup(text)
 
 
-def download_audio(local_dir: Path, repo_id: str, repo_type: str, repo_path: str, token: str) -> Path:
-    local_path = hf_hub_download(
-        repo_id=repo_id,
-        repo_type=repo_type,
-        filename=repo_path,
-        token=token,
-        local_dir=str(local_dir),
-    )
-    return Path(local_path)
-
-
-def call_qwen_transcriber(
-    *,
-    api_url: str,
-    api_key: str,
-    model: str,
-    audio_path: Path,
-    episode_no: int,
-    prompt: str,
-    timeout: int = 300,
-) -> Dict:
-    """
-    Generic OpenAI-compatible multimodal request.
-    If your free Qwen endpoint uses a different schema, edit only this function.
-    """
-    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
-    audio_format = audio_path.suffix.lower().lstrip(".") or "mp3"
-
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "max_tokens": 8000,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You transcribe long-form audio drama. "
-                    "Return strict JSON only, no markdown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Episode number: {episode_no}\n"
-                            f"Task: {prompt}\n\n"
-                            "Return JSON with these keys:\n"
-                            "- transcript\n"
-                            "- title\n"
-                            "- summary\n"
-                            "- continuity_notes\n"
-                            "- scene_notes\n"
-                            "- confidence\n"
-                            "- timestamp_notes\n"
-                        ),
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": audio_b64,
-                            "format": audio_format,
-                        },
-                    },
-                ],
-            },
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        api_url,
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    text = None
-    if isinstance(data, dict):
-        if "choices" in data and data["choices"]:
-            choice = data["choices"][0]
-            if isinstance(choice, dict):
-                msg = choice.get("message", {})
-                if isinstance(msg, dict):
-                    text = msg.get("content")
-                else:
-                    text = choice.get("text")
-        elif "output_text" in data:
-            text = data.get("output_text")
-        elif "content" in data:
-            text = data.get("content")
-
-    if isinstance(text, list):
-        text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in text)
-
-    if not text:
-        raise RuntimeError(f"Could not read text from response: {data}")
-
-    return json.loads(text.strip())
-
-
-def upload_text_file(
-    api: HfApi,
-    repo_id: str,
-    repo_type: str,
-    token: str,
-    local_path: Path,
-    path_in_repo: str,
-    commit_message: str,
-) -> None:
-    api.upload_file(
-        path_or_fileobj=str(local_path),
-        path_in_repo=path_in_repo,
-        repo_id=repo_id,
-        repo_type=repo_type,
-        token=token,
-        commit_message=commit_message,
-    )
-
-
-def save_json(path: Path, obj: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def main() -> None:
-    hf_token = env("HF_TOKEN", required=True)
-    source_repo = env("HF_SOURCE_REPO_ID", required=True)
-    source_repo_type = env("HF_SOURCE_REPO_TYPE", "dataset")
-    source_folder = env("HF_SOURCE_FOLDER", required=True)
-
-    output_repo = env("HF_OUTPUT_REPO_ID", source_repo)
-    output_repo_type = env("HF_OUTPUT_REPO_TYPE", "dataset")
-    output_folder = env("HF_OUTPUT_FOLDER", "Transcripts_Episode_0001_0200")
-
-    qwen_api_url = env("QWEN_API_URL", required=True)
-    qwen_api_key = env("QWEN_API_KEY", required=True)
-    qwen_model = env("QWEN_MODEL", "qwen-3.5-omni-plus")
-
-    request_delay_seconds = float(env("REQUEST_DELAY_SECONDS", "2.0"))
-    retry_base_seconds = float(env("RETRY_BASE_SECONDS", "8.0"))
-    max_retries = int(env("MAX_RETRIES", "5"))
-
-    prompt = env(
-        "TRANSCRIBE_PROMPT",
-        (
-            "Transcribe the audio exactly. "
-            "Keep ordering, speaker turns, narration, and continuity notes. "
-            "Return strict JSON."
-        ),
-    )
-
-    # This folder is local inside the GitHub Actions workspace.
-    local_repo_folder = Path(env("LOCAL_EPISODE_FOLDER", "episodes"))
-    local_repo_folder.mkdir(parents=True, exist_ok=True)
-
-    workdir = Path(env("WORKDIR", "/tmp/pocketfm_qwen_work"))
-    local_audio_dir = workdir / "audio"
-    state_dir = workdir / "state"
-    local_audio_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    done_path = state_dir / "done.json"
-    manifest_path = state_dir / MANIFEST_NAME
-
-    done = {}
-    if done_path.exists():
-        done = json.loads(done_path.read_text(encoding="utf-8"))
-
-    api = HfApi(token=hf_token)
-
-    audio_paths = list_remote_audio_paths(
-        api=api,
-        repo_id=source_repo,
-        repo_type=source_repo_type,
-        prefix=source_folder,
-    )
-    if not audio_paths:
-        raise RuntimeError(f"No audio files found under {source_folder} in {source_repo}")
-
-    records = []
-
-    for idx, repo_path in enumerate(audio_paths, start=1):
-        filename = Path(repo_path).name
-        rr = parse_range(filename)
-        episode_no = rr[0] if rr else idx
-
-        out_name = f"Episode_{episode_no:04d}.json"
-        local_out = local_repo_folder / out_name
-        remote_out = f"{output_folder}/{out_name}"
-
-        if done.get(out_name) == "uploaded":
-            records.append(
-                {
-                    "episode": episode_no,
-                    "source": repo_path,
-                    "output": out_name,
-                    "status": "skipped",
-                }
-            )
-            continue
-
-        if remote_file_exists(api, output_repo, output_repo_type, remote_out):
-            done[out_name] = "uploaded"
-            save_json(done_path, done)
-            records.append(
-                {
-                    "episode": episode_no,
-                    "source": repo_path,
-                    "output": out_name,
-                    "status": "already_remote",
-                }
-            )
-            continue
-
-        LOG.info("[%d/%d] downloading %s", idx, len(audio_paths), repo_path)
-        local_audio = download_audio(
-            local_dir=local_audio_dir,
-            repo_id=source_repo,
-            repo_type=source_repo_type,
-            repo_path=repo_path,
-            token=hf_token,
+def run_track_b_analysis(cleaned_text, episode_num):
+    """Track B: NVIDIA API for High-Thinking JSON extraction (30+ req/min)"""
+    system_prompt = """You are a highly advanced Story Intelligence AI. Analyze the given Hindi/Hinglish audio series transcript.
+    You MUST output valid JSON EXACTLY matching the provided structure. Do not output anything else.
+    Track character states, active plot threads, setups, payoffs, knowledge gaps, cliffhangers, and continuity constraints."""
+    
+    # Passing a strict instruction to return JSON
+    try:
+        completion = nvidia_client.chat.completions.create(
+            model="meta/llama3-70b-instruct", # Best open model on NVIDIA for logic
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Analyze this episode (Number {episode_num}) transcript and return the JSON:\n\n{cleaned_text}"}
+            ],
+            temperature=0.3,
+            max_tokens=3000,
+            response_format={"type": "json_object"}
         )
+        return json.loads(completion.choices[0].message.content)
+    except Exception as e:
+        print(f"NVIDIA API failed for Episode {episode_num}: {e}")
+        return {"episode": episode_num, "error": "Analysis failed"}
 
-        success = False
-        last_error = None
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                LOG.info("[%d/%d] transcribing episode %s attempt %d", idx, len(audio_paths), episode_no, attempt)
-                result = call_qwen_transcriber(
-                    api_url=qwen_api_url,
-                    api_key=qwen_api_key,
-                    model=qwen_model,
-                    audio_path=local_audio,
-                    episode_no=episode_no,
-                    prompt=prompt,
-                )
-                result.setdefault("episode", episode_no)
-                result.setdefault("source_repo_path", repo_path)
-                result.setdefault("source_file", filename)
-                result.setdefault("model", qwen_model)
-                result.setdefault("status", "ok")
+def upload_to_huggingface(commit_message):
+    """Batch upload the entire output folder to Hugging Face"""
+    print(f"Uploading batch to Hugging Face: {commit_message}...")
+    try:
+        hf_api.upload_folder(
+            folder_path=OUTPUT_BASE,
+            path_in_repo=OUTPUT_BASE,
+            repo_id=REPO_ID,
+            commit_message=commit_message
+        )
+        print("Upload successful!")
+    except Exception as e:
+        print(f"Upload failed: {e}")
 
-                save_json(local_out, result)
+# ================= Main Execution =================
 
-                records.append(
-                    {
-                        "episode": episode_no,
-                        "source": repo_path,
-                        "output": out_name,
-                        "status": "created_local",
-                    }
-                )
+def main():
+    # Load all transcripts
+    files = sorted(glob.glob(f"{INPUT_FOLDER}/*.txt"))
+    if not files:
+        print(f"No text files found in {INPUT_FOLDER}")
+        return
 
-                # Immediate upload to the Hugging Face output folder, but only after the
-                # transcript file has been written locally.
-                upload_text_file(
-                    api=api,
-                    repo_id=output_repo,
-                    repo_type=output_repo_type,
-                    token=hf_token,
-                    local_path=local_out,
-                    path_in_repo=remote_out,
-                    commit_message=f"Add transcript Episode {episode_no:04d}",
-                )
+    episodes_processed = 0
 
-                done[out_name] = "uploaded"
-                save_json(done_path, done)
-                success = True
-                break
+    for i, filepath in enumerate(files):
+        filename = os.path.basename(filepath)
+        episode_num_str = re.search(r'\d+', filename)
+        episode_num = int(episode_num_str.group()) if episode_num_str else i+1
 
-            except Exception as exc:
-                last_error = str(exc)
-                LOG.warning("Episode %s failed attempt %d: %s", episode_no, attempt, exc)
-                if attempt < max_retries:
-                    wait = retry_base_seconds * (2 ** (attempt - 1))
-                    time.sleep(wait)
+        print(f"\n--- Processing {filename} ---")
+        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
 
-        if not success:
-            records.append(
-                {
-                    "episode": episode_no,
-                    "source": repo_path,
-                    "output": out_name,
-                    "status": "failed",
-                    "error": last_error,
-                }
-            )
-            save_json(state_dir / "failed_last.json", {"episode": episode_no, "error": last_error})
-            raise RuntimeError(f"Episode {episode_no} failed after retries: {last_error}")
+        # Handle Context Boundaries (Previous/Next Snippets)
+        context = ""
+        # Assuming boundary means every 10th or specific structural episodes. 
+        # For this example, we fetch previous/next if available just to show the logic.
+        # User defined: "agar boundary range me hai to previous/next ka chhota snippet"
+        # We will keep it minimal to save tokens as requested.
+        is_boundary = (episode_num % 10 == 0) # Example boundary logic
+        if is_boundary:
+            if i > 0:
+                with open(files[i-1], 'r', encoding='utf-8') as prev_f:
+                    context += f"PREVIOUS EPISODE SNIPPET: {prev_f.read()[:500]}\n"
 
-        time.sleep(request_delay_seconds)
+        # 1. TRACK A (Cleanup)
+        cleaned_text = run_track_a_cleanup(raw_text, context)
+        track_a_path = os.path.join(TRACK_A_DIR, f"Cleaned_{filename}")
+        with open(track_a_path, 'w', encoding='utf-8') as f:
+            f.write(cleaned_text)
 
-    save_json(
-        manifest_path,
-        {
-            "source_repo": source_repo,
-            "source_folder": source_folder,
-            "output_repo": output_repo,
-            "output_folder": output_folder,
-            "audio_file_count": len(audio_paths),
-            "records": records,
-        },
-    )
-    LOG.info("Done. Manifest written to %s", manifest_path)
+        # 2. TRACK B (Story Intelligence)
+        analysis_json = run_track_b_analysis(cleaned_text, episode_num)
+        track_b_path = os.path.join(TRACK_B_DIR, f"Episode_{episode_num:04d}.json")
+        with open(track_b_path, 'w', encoding='utf-8') as f:
+            json.dump(analysis_json, f, ensure_ascii=False, indent=2)
 
+        # 3. TRAINING DATASET (JSONL)
+        jsonl_path = os.path.join(TRAINING_DIR, "training_data.jsonl")
+        with open(jsonl_path, 'a', encoding='utf-8') as f:
+            training_row = {
+                "instruction": f"Generate Episode {episode_num} based on current story state.",
+                "input_state": analysis_json.get("opening_state", {}),
+                "output_transcript": cleaned_text
+            }
+            f.write(json.dumps(training_row, ensure_ascii=False) + "\n")
+
+        episodes_processed += 1
+
+        # 4. BATCH UPLOAD (Every 20 Episodes)
+        if episodes_processed % 20 == 0:
+            upload_to_huggingface(f"Batch upload up to episode {episode_num}")
+            # Prevent rate limits just in case
+            time.sleep(10)
+
+    # Final upload for any remaining episodes (e.g., if total is not a multiple of 20)
+    if episodes_processed % 20 != 0:
+        upload_to_huggingface(f"Final batch upload completed")
 
 if __name__ == "__main__":
     main()
