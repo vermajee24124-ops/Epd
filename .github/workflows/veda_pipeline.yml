@@ -1,0 +1,38 @@
+name: Veda AI Audio Series Pipeline
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+  # schedule:
+  #   - cron: '0 0 * * *' # Uncomment to run automatically every night at midnight UTC
+
+jobs:
+  process_transcripts:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Check out the repository code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python environment
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # Step 3: Install necessary Python libraries
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub google-generativeai groq openai
+
+      # Step 4: Run the main pipeline script
+      - name: Run VEDA Training Pipeline
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python main.py
+          
