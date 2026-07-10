@@ -1,299 +1,137 @@
 #!/usr/bin/env python3
-import os,re,json,time
+import os,re,json,time,random,requests
 from pathlib import Path
-from google import genai
-from google.genai import types
 from huggingface_hub import HfApi,hf_hub_download,CommitOperationAdd
 
-HF_TOKEN=os.environ["HF_TOKEN"]
-GEMINI_API_KEY=os.environ["GEMINI_API_KEY"]
-
+HF_TOKEN=os.environ["HF_TOKEN"]; GROQ_API_KEY=os.environ["GROQ_API_KEY"]; NVIDIA_API_KEY=os.environ["NVIDIA_API_KEY"]
 SRC_REPO=os.getenv("HF_SOURCE_REPO_ID","Kumarverma11/PocketFM_Audio")
 SRC_FOLDER=os.getenv("HF_SOURCE_FOLDER","Transcripts_Episode_0001_to_0200")
 OUT_REPO=os.getenv("HF_OUTPUT_REPO_ID",SRC_REPO)
-OUT_FOLDER=os.getenv("HF_OUTPUT_FOLDER","Veda_Training_Ready_V7_0001_to_0200")
-
-PRIMARY=os.getenv("PRIMARY_MODEL","gemini-3.1-flash-lite")
-FALLBACK=os.getenv("FALLBACK_MODEL","gemini-3.5-flash")
-BATCH=int(os.getenv("BATCH_SIZE","20"))
-GAP=float(os.getenv("REQUEST_GAP_SECONDS","5.0"))
-MAX_TRIES=int(os.getenv("MAX_TRIES","4"))
-
-RANGES=((111,120),(121,130),(133,135),(138,139),(140,143))
-
-W=Path("/tmp/veda7")
-RAW=W/"raw"
-CLEAN=W/"TRACK_A_CLEAN_EPISODES"
-INTEL=W/"TRACK_B_STORY_INTELLIGENCE"
-DATA=W/"TRAINING_DATASETS"
-STATE=W/"STATE"
+OUT_FOLDER=os.getenv("HF_OUTPUT_FOLDER","Veda_Training_Ready_V8_0001_to_0200")
+GROQ_MODEL="llama-3.3-70b-versatile"
+NV_MODELS=("nvidia/nemotron-3-ultra-550b-a55b","deepseek-ai/deepseek-v4-pro")
+BATCH=20; RANGES=((111,120),(121,130),(133,135),(138,139),(140,143))
+GROQ_URL="https://api.groq.com/openai/v1/chat/completions"; NV_URL="https://integrate.api.nvidia.com/v1/chat/completions"
+W=Path("/tmp/veda8"); RAW=W/"raw"; CLEAN=W/"TRACK_A_CLEAN_EPISODES"; INTEL=W/"TRACK_B_STORY_INTELLIGENCE"; DATA=W/"TRAINING_DATASETS"; STATE=W/"STATE"
 for d in (RAW,CLEAN,INTEL,DATA,STATE): d.mkdir(parents=True,exist_ok=True)
-
-hf=HfApi(token=HF_TOKEN)
-ai=genai.Client(api_key=GEMINI_API_KEY)
+hf=HfApi(token=HF_TOKEN); http=requests.Session()
 
 def epno(s):
-    m=re.search(r"Episode[_\-\s]*(\d{1,4})",Path(s).name,re.I)
-    return int(m.group(1)) if m else None
-
-def is_boundary(n):
-    return any(a<=n<=b for a,b in RANGES)
-
-def response_text(r):
-    chunks=[]
-    for c in (getattr(r,"candidates",None) or []):
-        content=getattr(c,"content",None)
-        for part in (getattr(content,"parts",None) or []):
-            t=getattr(part,"text",None)
-            if t: chunks.append(t)
-    return "\n".join(chunks).strip()
-
-def diagnostics(n,model,r):
-    cs=getattr(r,"candidates",None) or []
-    print(
-        f"DIAG EP{n:04d} model={model} "
-        f"candidates={len(cs)} "
-        f"finish={[str(getattr(c,'finish_reason',None)) for c in cs]} "
-        f"parts={[len(getattr(getattr(c,'content',None),'parts',None) or []) for c in cs]} "
-        f"usage={getattr(r,'usage_metadata',None)}"
-    )
-
-def source_rows():
-    prefix=SRC_FOLDER.rstrip("/")+"/"
-    rows=[]
-    for x in hf.list_repo_tree(SRC_REPO,repo_type="dataset",recursive=True):
-        q=getattr(x,"path","")
-        n=epno(q)
-        if q.startswith(prefix) and q.lower().endswith(".txt") and n and 1<=n<=200:
-            rows.append((n,q))
-    rows.sort()
-    nums=[n for n,_ in rows]
-    missing=sorted(set(range(1,201))-set(nums))
-    dup=sorted({n for n in nums if nums.count(n)>1})
-    if len(rows)!=200 or missing or dup:
-        raise RuntimeError(f"SOURCE INVALID matched={len(rows)} missing={missing} duplicates={dup}")
-    return rows
-
-def remote_completed():
-    done=set()
-    prefix=f"{OUT_FOLDER}/TRACK_A_CLEAN_EPISODES/"
-    try:
-        for x in hf.list_repo_tree(OUT_REPO,repo_type="dataset",recursive=True):
-            q=getattr(x,"path","")
-            n=epno(q)
-            if q.startswith(prefix) and q.endswith(".txt") and n:
-                done.add(n)
-    except Exception as e:
-        print("Resume scan note:",e)
-    return done
-
-def load_remote_memory():
-    name=f"{OUT_FOLDER}/STATE/story_memory.json"
-    try:
-        p=hf_hub_download(OUT_REPO,filename=name,repo_type="dataset",token=HF_TOKEN,local_dir=str(W/"resume"))
-        return json.loads(Path(p).read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-SCHEMA={
-"type":"object",
-"properties":{
-"cleaned_transcript":{"type":"string"},
-"episode_summary":{"type":"string"},
-"character_state":{"type":"array","items":{"type":"object","properties":{
-"name":{"type":"string"},"state":{"type":"string"},"goal":{"type":"string"},
-"knowledge":{"type":"string"},"relationship_changes":{"type":"string"}},
-"required":["name","state","goal","knowledge","relationship_changes"]}},
-"plot_threads":{"type":"array","items":{"type":"string"}},
-"conflict":{"type":"string"},
-"turning_point":{"type":"string"},
-"setup_payoff":{"type":"array","items":{"type":"string"}},
-"cliffhanger":{"type":"string"},
-"continuity_constraints":{"type":"array","items":{"type":"string"}},
-"next_episode_logic":{"type":"array","items":{"type":"string"}},
-"important_facts":{"type":"array","items":{"type":"string"}},
-"story_learning":{"type":"string"}
-},
-"required":["cleaned_transcript","episode_summary","character_state","plot_threads","conflict",
-"turning_point","setup_payoff","cliffhanger","continuity_constraints","next_episode_logic",
-"important_facts","story_learning"]
-}
-
-def make_prompt(n,raw,prev,nxt,memory):
-    if is_boundary(n):
-        boundary=f"""
-SPECIAL BOUNDARY REPAIR MODE IS ACTIVE because Episode {n} belongs to a range previously split from a merged audio file.
-Compare only the end of the previous raw episode, the current raw episode, and the start of the next raw episode.
-Repair misplaced or duplicated boundary lines and sentences cut exactly at the boundary.
-Do not merge whole episodes and do not move a scene unless the textual continuity clearly proves the cut was wrong.
-
-PREVIOUS RAW EPISODE END:
-{prev[-5000:]}
-
-NEXT RAW EPISODE START:
-{nxt[:5000]}
-"""
-    else:
-        boundary="NORMAL MODE: Do not perform cross-episode boundary rewriting."
-
-    return f"""
-You are processing Episode {n} of a FICTIONAL HINDI DRAMA AUDIO SERIES for machine-learning training data.
-
-FICTION CONTEXT:
-The existing story may contain arguments, threats, villains, crime references, fights, injuries, kidnapping references, emotional conflict, or suspense. These are fictional plot events already present in the transcript. Analyze and preserve them as story content. Do not refuse, censor, soften, moralize, or replace an existing fictional scene merely because conflict appears. Do not add graphic detail. Do not invent new violent events.
-
-TASK A — CLEAN TRANSCRIPT:
-Fix Hindi grammar, obvious ASR/transcription errors, punctuation, sentence breaks, and clearly wrong character names only when context proves the correction.
-Preserve natural Hindustani/Hinglish.
-Preserve every real story event, dialogue order, chronology, suspense, ending, and cliffhanger.
-Do not summarize or shorten.
-Do not rewrite in a new literary style.
-Do not add scenes or dialogue.
-
-{boundary}
-
-TASK B — STORY INTELLIGENCE:
-Using the cleaned episode and prior memory, extract character states, goals, current knowledge, relationship changes, active plot threads, conflict, turning point, setup/payoff, cliffhanger, continuity constraints, next-episode logic supported by canon, important facts, and story-writing lesson.
-Never invent future canon.
-Never give a character knowledge the transcript does not show.
-Track secrets and hidden identities carefully.
-
-PRIOR STORY MEMORY:
-{json.dumps(memory,ensure_ascii=False)}
-
-CURRENT RAW TRANSCRIPT:
-{raw}
-
-Return the required structured JSON only.
-""".strip()
-
-def process_episode(n,raw,prev,nxt,memory):
-    prompt=make_prompt(n,raw,prev,nxt,memory)
-    errors=[]
-    for model in (PRIMARY,FALLBACK):
-        for attempt in range(1,MAX_TRIES+1):
-            try:
-                print(f"PROCESS EP{n:04d} model={model} attempt={attempt}/{MAX_TRIES}")
-                r=ai.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=65536,
-                        response_mime_type="application/json",
-                        response_json_schema=SCHEMA,
-                        thinking_config=types.ThinkingConfig(thinking_level="high"),
-                    ),
-                )
-                diagnostics(n,model,r)
-                t=response_text(r)
-                if not t:
-                    raise RuntimeError("API returned HTTP response but zero text candidates")
-                z=json.loads(t)
-                if len(z.get("cleaned_transcript","").strip())<200:
-                    raise RuntimeError("cleaned transcript is empty or suspiciously short")
-                return z,model
-            except Exception as e:
-                errors.append(f"{model}#{attempt}: {e}")
-                print("REQUEST FAILED:",e)
-                if attempt<MAX_TRIES:
-                    wait=8*attempt
-                    print(f"Retry in {wait}s")
-                    time.sleep(wait)
-        print("MODEL FALLBACK:",model,"-> next model")
-    raise RuntimeError(f"Episode {n:04d} failed on all models | "+" | ".join(errors))
-
-def save_text(p,t):
-    p.write_text(t.strip()+"\n",encoding="utf-8")
-
-def save_json(p,z):
-    p.write_text(json.dumps(z,ensure_ascii=False,indent=2),encoding="utf-8")
-
-def append_jsonl(p,z):
-    with p.open("a",encoding="utf-8") as f:
-        f.write(json.dumps(z,ensure_ascii=False)+"\n")
-
-def update_memory(old,z,n):
-    return {
-        "last_completed_episode":n,
-        "latest_episode_summary":z["episode_summary"],
-        "character_state":z["character_state"],
-        "active_plot_threads":list(dict.fromkeys(old.get("active_plot_threads",[])+z["plot_threads"]))[-100:],
-        "important_facts":list(dict.fromkeys(old.get("important_facts",[])+z["important_facts"]))[-150:],
-        "continuity_constraints":list(dict.fromkeys(old.get("continuity_constraints",[])+z["continuity_constraints"]))[-120:],
-        "latest_cliffhanger":z["cliffhanger"],
-        "next_episode_logic":z["next_episode_logic"],
-    }
-
-def upload(pending,msg):
-    ops=[CommitOperationAdd(path_in_repo=k,path_or_fileobj=str(v)) for k,v in sorted(pending.items())]
-    if ops:
-        hf.create_commit(repo_id=OUT_REPO,repo_type="dataset",operations=ops,commit_message=msg,token=HF_TOKEN)
-
+ m=re.search(r"Episode[_\-\s]*(\d{1,4})",Path(s).name,re.I); return int(m.group(1)) if m else None
+def boundary(n): return any(a<=n<=b for a,b in RANGES)
+def wait_value(v,default=30):
+ if not v:return default
+ try:return max(1,float(v))
+ except:pass
+ total=0
+ for x,u in re.findall(r"([\d.]+)\s*(ms|s|m|h)",v.lower()):
+  x=float(x); total+=x/1000 if u=="ms" else x if u=="s" else x*60 if u=="m" else x*3600
+ return max(1,total or default)
+def call(url,key,payload,label,tries=6):
+ h={"Authorization":f"Bearer {key}","Content-Type":"application/json"}; last=None
+ for a in range(1,tries+1):
+  try:
+   r=http.post(url,headers=h,json=payload,timeout=(30,900))
+   print(f"{label} HTTP={r.status_code} try={a}/{tries} req_left={r.headers.get('x-ratelimit-remaining-requests')} tok_left={r.headers.get('x-ratelimit-remaining-tokens')}")
+   if r.status_code==200:
+    z=r.json(); ch=z.get("choices") or []
+    if ch and ((ch[0].get("message") or {}).get("content") or "").strip(): return ch[0]["message"]["content"].strip()
+    last=RuntimeError("HTTP 200 but empty choices/content")
+   elif r.status_code in (400,401,403,404): raise RuntimeError(f"NON-RETRYABLE HTTP {r.status_code}: {r.text[:1000]}")
+   else: last=RuntimeError(f"HTTP {r.status_code}: {r.text[:1000]}")
+   if r.status_code==429: delay=wait_value(r.headers.get("retry-after") or r.headers.get("x-ratelimit-reset-tokens") or r.headers.get("x-ratelimit-reset-requests"),60)
+   else: delay=min(120,8*(2**(a-1)))
+  except requests.RequestException as e: last=e; delay=min(120,8*(2**(a-1)))
+  if a<tries:
+   delay+=random.uniform(.5,2); print(f"{label} retry in {delay:.1f}s"); time.sleep(delay)
+ raise RuntimeError(f"{label} failed: {last}")
+def json_obj(t):
+ t=t.strip(); t=re.sub(r"^```(?:json)?\s*","",t,flags=re.I); t=re.sub(r"\s*```$","",t)
+ try:return json.loads(t)
+ except:return json.loads(t[t.find("{"):t.rfind("}")+1])
+def rows():
+ pre=SRC_FOLDER.rstrip("/")+"/"; out=[]
+ for x in hf.list_repo_tree(SRC_REPO,repo_type="dataset",recursive=True):
+  q=getattr(x,"path",""); n=epno(q)
+  if q.startswith(pre) and q.lower().endswith(".txt") and n and 1<=n<=200:out.append((n,q))
+ out.sort(); nums=[n for n,_ in out]; miss=sorted(set(range(1,201))-set(nums)); dup=sorted({n for n in nums if nums.count(n)>1})
+ if len(out)!=200 or miss or dup:raise RuntimeError(f"SOURCE INVALID count={len(out)} missing={miss} duplicates={dup}")
+ return out
+def done_set():
+ out=set(); pre=f"{OUT_FOLDER}/TRACK_B_STORY_INTELLIGENCE/"
+ try:
+  for x in hf.list_repo_tree(OUT_REPO,repo_type="dataset",recursive=True):
+   q=getattr(x,"path",""); n=epno(q)
+   if q.startswith(pre) and q.endswith(".json") and n:out.add(n)
+ except Exception as e:print("Resume scan:",e)
+ return out
+def remote_json(path):
+ try:
+  p=hf_hub_download(OUT_REPO,filename=path,repo_type="dataset",token=HF_TOKEN,local_dir=str(W/"resume")); return json.loads(Path(p).read_text(encoding="utf-8"))
+ except:return {}
+def clean(n,cur,prev,nxt):
+ b=f"""SPECIAL BOUNDARY REPAIR. Episode {n} came from a previously merged audio file. Compare PREVIOUS END, CURRENT and NEXT START. Remove from CURRENT only lines clearly belonging to the adjacent episode. Repair only a sentence cut exactly at the boundary. Do not merge episodes or invent scenes.
+PREVIOUS END:\n{prev[-5000:]}\nNEXT START:\n{nxt[:5000]}""" if boundary(n) else "NORMAL MODE. Do not rewrite episode boundaries."
+ prompt=f"""You are a precision transcript editor for a FICTIONAL HINDI DRAMA AUDIO SERIES. Existing fictional arguments, threats, villains, crime references, fights, injuries, kidnapping references, emotional conflict and suspense are plot events. Preserve them. Do not moralize, censor, summarize, or add graphic detail.
+Fix obvious Hindi grammar, ASR errors, punctuation, sentence breaks, and clearly wrong character names only when context proves the correction. Preserve natural Hindi/Hindustani/Hinglish, every event, dialogue order, chronology, suspense, ending and cliffhanger. Do not shorten, summarize, add scenes, or add dialogue. Return ONLY the full cleaned transcript.
+{b}
+EPISODE {n}\nCURRENT RAW TRANSCRIPT:\n{cur}"""
+ return call(GROQ_URL,GROQ_API_KEY,{"model":GROQ_MODEL,"messages":[{"role":"user","content":prompt}],"temperature":0.05,"max_tokens":32768,"stream":False},f"GROQ EP{n:04d}")
+def analyze(n,txt,memory):
+ shape='{"episode":1,"episode_summary":"string","character_state":[{"name":"string","state":"string","goal":"string","knowledge":"string","secrets_or_unknowns":"string","relationship_changes":"string"}],"plot_threads":["string"],"conflict":"string","turning_point":"string","setup_payoff":["string"],"cliffhanger":"string","continuity_constraints":["string"],"next_episode_logic":["string"],"important_facts":["string"],"story_learning":"string"}'
+ prompt=f"""Analyze Episode {n} of a FICTIONAL HINDI DRAMA for story-continuity training. Reason deeply internally but return ONLY valid JSON and never expose chain-of-thought. Track character state, goal, knowledge, secrets, hidden identity, relationship changes, plot threads, conflict, turning point, setup/payoff, cliffhanger, continuity constraints, important facts and canon-supported next-episode logic. Never invent future canon or give a character knowledge they do not possess.
+JSON SHAPE:{shape}
+PRIOR MEMORY:{json.dumps(memory,ensure_ascii=False)}
+CLEAN EPISODE:{txt}"""
+ errs=[]
+ for model in NV_MODELS:
+  try:
+   out=call(NV_URL,NVIDIA_API_KEY,{"model":model,"messages":[{"role":"user","content":prompt}],"temperature":0.2,"max_tokens":16384,"stream":False},f"NVIDIA {model} EP{n:04d}")
+   z=json_obj(out); required=("episode_summary","character_state","plot_threads","conflict","turning_point","setup_payoff","cliffhanger","continuity_constraints","next_episode_logic","important_facts","story_learning")
+   miss=[k for k in required if k not in z]
+   if miss:raise RuntimeError(f"JSON missing {miss}")
+   z["episode"]=n; z["analysis_model"]=model; return z
+  except Exception as e:errs.append(f"{model}: {e}"); print("NVIDIA MODEL FAIL:",e)
+ raise RuntimeError("All NVIDIA models failed | "+" | ".join(errs))
+def savej(p,z):p.write_text(json.dumps(z,ensure_ascii=False,indent=2),encoding="utf-8")
+def memory(old,z,n):
+ u=lambda a,l:list(dict.fromkeys(a))[-l:]
+ return {"last_completed_episode":n,"latest_episode_summary":z["episode_summary"],"character_state":z["character_state"],"active_plot_threads":u(old.get("active_plot_threads",[])+z["plot_threads"],100),"important_facts":u(old.get("important_facts",[])+z["important_facts"],180),"continuity_constraints":u(old.get("continuity_constraints",[])+z["continuity_constraints"],140),"latest_cliffhanger":z["cliffhanger"],"next_episode_logic":z["next_episode_logic"]}
+def restore(done):
+ for n in sorted(done):
+  for folder,local,ext in (("TRACK_A_CLEAN_EPISODES",CLEAN,"txt"),("TRACK_B_STORY_INTELLIGENCE",INTEL,"json")):
+   q=f"{OUT_FOLDER}/{folder}/Episode_{n:04d}.{ext}"; p=hf_hub_download(OUT_REPO,filename=q,repo_type="dataset",token=HF_TOKEN,local_dir=str(W/"restore")); (local/f"Episode_{n:04d}.{ext}").write_bytes(Path(p).read_bytes())
+def upload(batch,mem):
+ ta=DATA/"track_a_clean_story_text.jsonl"; tb=DATA/"track_b_story_intelligence.jsonl"
+ complete=[n for n in range(1,201) if (CLEAN/f"Episode_{n:04d}.txt").exists() and (INTEL/f"Episode_{n:04d}.json").exists()]
+ with ta.open("w",encoding="utf-8") as a,tb.open("w",encoding="utf-8") as b:
+  for n in complete:
+   a.write(json.dumps({"episode":n,"text":(CLEAN/f"Episode_{n:04d}.txt").read_text(encoding="utf-8").strip()},ensure_ascii=False)+"\n")
+   b.write(json.dumps(json.loads((INTEL/f"Episode_{n:04d}.json").read_text(encoding="utf-8")),ensure_ascii=False)+"\n")
+ mf=STATE/"story_memory.json";savej(mf,mem); pending={}
+ for n in batch:
+  pending[f"{OUT_FOLDER}/TRACK_A_CLEAN_EPISODES/Episode_{n:04d}.txt"]=CLEAN/f"Episode_{n:04d}.txt";pending[f"{OUT_FOLDER}/TRACK_B_STORY_INTELLIGENCE/Episode_{n:04d}.json"]=INTEL/f"Episode_{n:04d}.json"
+ pending[f"{OUT_FOLDER}/TRAINING_DATASETS/{ta.name}"]=ta;pending[f"{OUT_FOLDER}/TRAINING_DATASETS/{tb.name}"]=tb;pending[f"{OUT_FOLDER}/STATE/story_memory.json"]=mf
+ ops=[CommitOperationAdd(path_in_repo=k,path_or_fileobj=str(v)) for k,v in sorted(pending.items())]
+ hf.create_commit(repo_id=OUT_REPO,repo_type="dataset",operations=ops,commit_message=f"Veda V8 Episodes {batch[0]:04d}-{batch[-1]:04d}",token=HF_TOKEN);print("HF BATCH SUCCESS",batch)
 def main():
-    rows=source_rows()
-    print("PASS exact 1-200 source folder:",SRC_FOLDER)
-    raw={}
-    for i,(n,q) in enumerate(rows,1):
-        fp=hf_hub_download(SRC_REPO,filename=q,repo_type="dataset",token=HF_TOKEN,local_dir=str(RAW))
-        raw[n]=Path(fp).read_text(encoding="utf-8",errors="replace").strip()
-        if i%25==0: print(f"Downloaded {i}/200")
-
-    done=remote_completed()
-    memory=load_remote_memory() if done else {}
-    print("Remote completed:",len(done),"/200")
-    print("Primary:",PRIMARY)
-    print("Fallback:",FALLBACK)
-    print("Architecture: ONE AI request per episode -> Track A + Track B")
-
-    track_a=DATA/"track_a_clean_story_text.jsonl"
-    track_b=DATA/"track_b_story_intelligence.jsonl"
-    memory_file=STATE/"story_memory.json"
-    pending={}
-    batch_count=0
-
-    for n in range(1,201):
-        if n in done:
-            print(f"[{n:03d}/200] REMOTE EXISTS -> SKIP")
-            continue
-
-        z,used=process_episode(n,raw[n],raw.get(n-1,""),raw.get(n+1,""),memory)
-        clean=z.pop("cleaned_transcript").strip()
-        z["episode"]=n
-        z["model_used"]=used
-
-        cp=CLEAN/f"Episode_{n:04d}.txt"
-        ip=INTEL/f"Episode_{n:04d}.json"
-        save_text(cp,clean)
-        save_json(ip,z)
-        append_jsonl(track_a,{"episode":n,"text":clean,"model_used":used})
-        append_jsonl(track_b,z)
-
-        memory=update_memory(memory,z,n)
-        save_json(memory_file,memory)
-
-        pending[f"{OUT_FOLDER}/TRACK_A_CLEAN_EPISODES/{cp.name}"]=cp
-        pending[f"{OUT_FOLDER}/TRACK_B_STORY_INTELLIGENCE/{ip.name}"]=ip
-        pending[f"{OUT_FOLDER}/TRAINING_DATASETS/{track_a.name}"]=track_a
-        pending[f"{OUT_FOLDER}/TRAINING_DATASETS/{track_b.name}"]=track_b
-        pending[f"{OUT_FOLDER}/STATE/story_memory.json"]=memory_file
-
-        batch_count+=1
-        print(f"[{n:03d}/200] SUCCESS model={used} batch={batch_count}/{BATCH}")
-
-        if batch_count>=BATCH:
-            upload(pending,f"Veda V7 batch through Episode {n:04d}")
-            print("BATCH UPLOAD SUCCESS")
-            pending={}
-            batch_count=0
-
-        time.sleep(GAP)
-
-    if pending:
-        upload(pending,"Veda V7 final partial batch")
-        print("FINAL BATCH UPLOAD SUCCESS")
-
-    print("VEDA V7 COMPLETE")
-
-if __name__=="__main__":
-    main()
+ src=rows();print("PASS source 1-200:",SRC_FOLDER);raw={}
+ for i,(n,q) in enumerate(src,1):
+  p=hf_hub_download(SRC_REPO,filename=q,repo_type="dataset",token=HF_TOKEN,local_dir=str(RAW));raw[n]=Path(p).read_text(encoding="utf-8",errors="replace").strip()
+  if i%25==0:print(f"Downloaded {i}/200")
+ done=done_set();print(f"Remote complete {len(done)}/200")
+ if done:restore(done)
+ mem=remote_json(f"{OUT_FOLDER}/STATE/story_memory.json");batch=[]
+ print("TRACK A Groq:",GROQ_MODEL);print("TRACK B NVIDIA:",NV_MODELS);print("Adaptive 429 Retry-After enabled")
+ for n in range(1,201):
+  if n in done:print(f"[{n:03d}/200] SKIP");continue
+  print(f"===== EPISODE {n:04d} =====")
+  txt=clean(n,raw[n],raw.get(n-1,""),raw.get(n+1,""))
+  if len(txt)<200:raise RuntimeError(f"Groq output too short EP{n}")
+  cp=CLEAN/f"Episode_{n:04d}.txt";cp.write_text(txt.strip()+"\n",encoding="utf-8");time.sleep(6)
+  z=analyze(n,txt,mem);ip=INTEL/f"Episode_{n:04d}.json";savej(ip,z);mem=memory(mem,z,n);time.sleep(2)
+  batch.append(n);print(f"[{n:03d}/200] COMPLETE batch={len(batch)}/{BATCH}")
+  if len(batch)>=BATCH:upload(batch,mem);done.update(batch);batch=[]
+ if batch:upload(batch,mem)
+ print("VEDA V8 COMPLETE")
+if __name__=="__main__":main()
