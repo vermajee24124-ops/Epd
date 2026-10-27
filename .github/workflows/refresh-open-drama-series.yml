@@ -1,0 +1,34 @@
+name: Refresh open drama series research catalog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1" # Monday 03:23 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Refresh public metadata (CPU only)
+        run: python research/open_short_drama_series/scripts/refresh_catalog.py --out-dir research/open_short_drama_series/generated
+      - name: Commit refreshed metadata snapshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/open_short_drama_series/generated
+          if ! git diff --cached --quiet; then
+            git commit -m "Refresh open drama series candidate catalogue"
+            git push
+          else
+            echo "No catalog changes to commit."
+          fi
